@@ -16,15 +16,15 @@ logger = logging.getLogger(__name__)
 # Константы для категорий
 GENRES = [
     "Jangari", "Drama", "Komediya", "Melodrama", "Sarguzasht", 
-    "Qorqinchli", "Tarixiy", "Klassika", "Fantastika", "Hayotiy",
-    "Triller", "Detektiv", "Hujjatli_film", "Anime", "Kriminal",
+    "Qo'rqinchli", "Tarixiy", "Klassika", "Fantastika", "Hayotiy",
+    "Triller", "Detektiv", "Hujjatli film", "Anime", "Kriminal",
     "Fentezi", "Afsona", "Vester", "Musiqiy"
 ]
 
 COUNTRIES = [
     "Rossiya", "AQSH", "Turkiya", "Xitoy", "Hindiston", 
-    "Avstraliya", "Buyuk_britaniya", "Janubiy_koreya", "Ukraina",
-    "Qozogiston", "Fransiya", "Eron", "Yaponiya"
+    "Avstraliya", "Buyuk britaniya", "Janubiy koreya", "Ukraina",
+    "Qozog'iston", "Fransiya", "Eron", "Yaponiya"
 ]
 
 YEARS = [str(year) for year in range(2025, 2009, -1)]
@@ -1555,7 +1555,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_analytics":
         await show_admin_analytics(query)
     elif data == "admin_broadcast":
-        await query.message.reply_text("📨 Xabar yuborish uchun /broadcast <xabar> buyrug'idan foydalaning")
+        await query.message.reply_text("📨 Xabar yuborish uchun xabarga javob bering: /broadcast")
 
 async def check_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2192,6 +2192,10 @@ async def send_movie_details_after_download(context, user_id, movie_code, title)
 
 # АДМИН ФУНКЦИИ
 async def handle_admin_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик видео для админов"""
+    if not update.message or not update.effective_user:
+        return
+    
     user = update.effective_user
     if user.id not in ADMIN_IDS:
         return
@@ -2371,68 +2375,63 @@ async def delete_movie_command(update: Update, context: ContextTypes.DEFAULT_TYP
             "Yoki admin panel orqali o'chirishingiz mumkin"
         )
 
-# УПРОЩЕННАЯ РАССЫЛКА
+# РАБОТАЮЩАЯ РАССЫЛКА
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Упрощенная команда рассылки"""
+    """Рассылка сообщения всем пользователям"""
     user = update.effective_user
     if user.id not in ADMIN_IDS:
         return
     
-    if not context.args:
-        await update.message.reply_text(
-            "📨 Xabar yuborish uchun:\n\n"
-            "/broadcast <xabar matni>\n\n"
-            "Misol: /broadcast Yangi filmlar qo'shildi!"
+    if update.message.reply_to_message:
+        # Если ответ на сообщение
+        message_to_send = update.message.reply_to_message
+        users = db.get_all_users()
+        total_users = len(users)
+        success_count = 0
+        failed_count = 0
+        
+        status_message = await update.message.reply_text(
+            f"📨 Xabar yuborish boshlandi...\n"
+            f"👥 Jami foydalanuvchilar: {total_users}\n"
+            f"✅ Muvaffaqiyatli: 0\n"
+            f"❌ Muvaffaqiyatsiz: 0"
         )
-        return
-    
-    message_text = ' '.join(context.args)
-    users = db.get_all_users()
-    total_users = len(users)
-    success_count = 0
-    failed_count = 0
-    
-    # Отправляем сообщение о начале рассылки
-    status_message = await update.message.reply_text(
-        f"📨 Xabar yuborish boshlandi...\n"
-        f"👥 Jami foydalanuvchilar: {total_users}\n"
-        f"✅ Muvaffaqiyatli: 0\n"
-        f"❌ Muvaffaqiyatsiz: 0"
-    )
-    
-    for user_data in users:
-        user_id = user_data[0]
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=message_text
-            )
-            success_count += 1
-            
-            # Обновляем статус каждые 10 сообщений
-            if success_count % 10 == 0:
-                await status_message.edit_text(
-                    f"📨 Xabar yuborish davom etmoqda...\n"
-                    f"👥 Jami foydalanuvchilar: {total_users}\n"
-                    f"✅ Muvaffaqiyatli: {success_count}\n"
-                    f"❌ Muvaffaqiyatsiz: {failed_count}"
-                )
-            
-            # Небольшая задержка чтобы не превысить лимиты Telegram
-            await asyncio.sleep(0.1)
-            
-        except Exception as e:
-            failed_count += 1
-            logger.error(f"Xabar yuborishda xato {user_id}: {e}")
-    
-    # Финальное сообщение
-    await status_message.edit_text(
-        f"✅ Xabar yuborish yakunlandi!\n\n"
-        f"👥 Jami foydalanuvchilar: {total_users}\n"
-        f"✅ Muvaffaqiyatli: {success_count}\n"
-        f"❌ Muvaffaqiyatsiz: {failed_count}\n\n"
-        f"Xabar matni: {message_text}"
-    )
+        
+        for user_data in users:
+            user_id = user_data[0]
+            try:
+                await message_to_send.copy(chat_id=user_id)
+                success_count += 1
+                
+                # Обновляем статус каждые 10 сообщений
+                if success_count % 10 == 0:
+                    await status_message.edit_text(
+                        f"📨 Xabar yuborish davom etmoqda...\n"
+                        f"👥 Jami foydalanuvchilar: {total_users}\n"
+                        f"✅ Muvaffaqiyatli: {success_count}\n"
+                        f"❌ Muvaffaqiyatsiz: {failed_count}"
+                    )
+                
+                # Небольшая задержка чтобы не превысить лимиты Telegram
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"Xabar yuborishda xato {user_id}: {e}")
+        
+        # Финальное сообщение
+        await status_message.edit_text(
+            f"✅ Xabar yuborish yakunlandi!\n\n"
+            f"👥 Jami foydalanuvchilar: {total_users}\n"
+            f"✅ Muvaffaqiyatli: {success_count}\n"
+            f"❌ Muvaffaqiyatsiz: {failed_count}"
+        )
+    else:
+        await update.message.reply_text(
+            "📨 Xabar yuborish uchun xabarga javob bering:\n\n"
+            "1. Xabar yozing (matn, rasm, video)\n"
+            "2. Xabarga javob bering: /broadcast"
+        )
 
 # НОВЫЕ КОМАНДЫ
 async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2527,5 +2526,8 @@ def main():
     
     application.run_polling()
 
+
+
+    
 if __name__ == "__main__":
     main()

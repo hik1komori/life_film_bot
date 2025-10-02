@@ -4,6 +4,7 @@ import os
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 
+
 # ID администраторов
 ADMIN_IDS = [6531897948, 7540286215]
 
