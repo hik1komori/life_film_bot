@@ -16,15 +16,15 @@ logger = logging.getLogger(__name__)
 # Константы для категорий
 GENRES = [
     "Jangari", "Drama", "Komediya", "Melodrama", "Sarguzasht", 
-    "Qo'rqinchli", "Tarixiy", "Klassika", "Fantastika", "Hayotiy",
-    "Triller", "Detektiv", "Hujjatli film", "Anime", "Kriminal",
+    "Qorqinchli", "Tarixiy", "Klassika", "Fantastika", "Hayotiy",
+    "Triller", "Detektiv", "Hujjatli_film", "Anime", "Kriminal",
     "Fentezi", "Afsona", "Vester", "Musiqiy"
 ]
 
 COUNTRIES = [
     "Rossiya", "AQSH", "Turkiya", "Xitoy", "Hindiston", 
     "Avstraliya", "Buyuk britaniya", "Janubiy koreya", "Ukraina",
-    "Qozog'iston", "Fransiya", "Eron", "Yaponiya"
+    "Qozogiston", "Fransiya", "Eron", "Yaponiya"
 ]
 
 YEARS = [str(year) for year in range(2025, 2009, -1)]
