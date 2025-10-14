@@ -15,7 +15,6 @@ ARCHIVE_CHANNEL_ID = -1003176364637
 REQUIRED_CHANNELS = {
     -1003057775634: "@LifeFilm_uz",
     -1003033129324: "@Xbet_Linebet_1xbet_Melbet_1Win",
-    -1002311525761: "@diamond_live500",
     -1002774096741: "@azyro_live"
 
 }
