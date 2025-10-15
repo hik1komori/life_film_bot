@@ -3,8 +3,8 @@ import sqlite3
 import re
 import asyncio
 import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, CallbackQueryHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, ChatJoinRequest
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, CallbackQueryHandler, filters, ChatMemberHandler, ChatJoinRequestHandler
 from config import BOT_TOKEN, ADMIN_IDS, ARCHIVE_CHANNEL_ID, REQUIRED_CHANNELS, CODES_CHANNEL
 
 logging.basicConfig(
@@ -77,6 +77,21 @@ class Database:
                 invite_link TEXT,
                 is_active BOOLEAN DEFAULT TRUE,
                 is_private BOOLEAN DEFAULT FALSE
+            )
+        ''')
+        
+        # НОВАЯ ТАБЛИЦА ДЛЯ ЗАЯВОК
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS channel_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                channel_id INTEGER,
+                status TEXT DEFAULT 'pending', -- pending, approved, rejected, cancelled
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (user_id),
+                FOREIGN KEY (channel_id) REFERENCES channels (channel_id),
+                UNIQUE(user_id, channel_id)
             )
         ''')
         
@@ -205,6 +220,25 @@ class Database:
             except sqlite3.OperationalError:
                 pass
         
+        # Создаем таблицу для заявок если ее нет
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS channel_requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    channel_id INTEGER,
+                    status TEXT DEFAULT 'pending',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users (user_id),
+                    FOREIGN KEY (channel_id) REFERENCES channels (channel_id),
+                    UNIQUE(user_id, channel_id)
+                )
+            ''')
+            print("✅ Channel_requests jadvali yaratildi")
+        except sqlite3.OperationalError:
+            pass
+        
         # Обновляем существующие записи
         cursor.execute('UPDATE movies SET title = ? WHERE title IS NULL', ("Nomsiz film",))
         
@@ -217,6 +251,103 @@ class Database:
         
         conn.commit()
         conn.close()
+
+    # НОВЫЕ МЕТОДЫ ДЛЯ РАБОТЫ С ЗАЯВКАМИ
+    def add_channel_request(self, user_id, channel_id, status='pending'):
+        """Добавляет или обновляет заявку на вступление в канал"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT OR REPLACE INTO channel_requests 
+                (user_id, channel_id, status, updated_at) 
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (user_id, channel_id, status))
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"❌ So'rov qo'shishda xato: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def get_channel_request(self, user_id, channel_id):
+        """Получает информацию о заявке пользователя"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT status, created_at FROM channel_requests WHERE user_id = ? AND channel_id = ?',
+            (user_id, channel_id)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        return result
+    
+    def get_pending_requests_count(self, channel_id=None):
+        """Получает количество ожидающих заявок"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        if channel_id:
+            cursor.execute(
+                'SELECT COUNT(*) FROM channel_requests WHERE status = "pending" AND channel_id = ?',
+                (channel_id,)
+            )
+        else:
+            cursor.execute('SELECT COUNT(*) FROM channel_requests WHERE status = "pending"')
+        
+        result = cursor.fetchone()[0]
+        conn.close()
+        return result
+    
+    def update_channel_request_status(self, user_id, channel_id, status):
+        """Обновляет статус заявки"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                UPDATE channel_requests 
+                SET status = ?, updated_at = CURRENT_TIMESTAMP 
+                WHERE user_id = ? AND channel_id = ?
+            ''', (status, user_id, channel_id))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            print(f"❌ So'rov yangilashda xato: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def delete_channel_request(self, user_id, channel_id):
+        """Удаляет заявку пользователя"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                'DELETE FROM channel_requests WHERE user_id = ? AND channel_id = ?',
+                (user_id, channel_id)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            print(f"❌ So'rovni o'chirishda xato: {e}")
+            return False
+        finally:
+            conn.close()
+    
+    def get_user_channel_requests(self, user_id):
+        """Получает все заявки пользователя"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT cr.channel_id, cr.status, c.title, c.username, c.is_private
+            FROM channel_requests cr
+            JOIN channels c ON cr.channel_id = c.channel_id
+            WHERE cr.user_id = ?
+        ''', (user_id,))
+        result = cursor.fetchall()
+        conn.close()
+        return result
 
     def _extract_clean_title(self, caption):
         """Извлекает чистое название из описания для поиска"""
@@ -921,9 +1052,9 @@ class Database:
 db = Database()
 db.update_database()
 
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПРОВЕРКИ ПОДПИСКИ
 async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Проверяет подписку на все каналы"""
+    """Проверяет подписку на все каналы - РАЗДЕЛЬНАЯ ПРОВЕРКА"""
     channels = db.get_all_channels()
     not_subscribed = []
     
@@ -933,17 +1064,14 @@ async def check_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     for channel_id, username, title, invite_link, is_private in channels:
         try:
             if is_private:
-                if not invite_link:
+                # ДЛЯ ПРИВАТНЫХ КАНАЛОВ - проверяем заявки
+                request = db.get_channel_request(user_id, channel_id)
+                if not request or request[0] not in ['pending', 'approved']:
+                    # Нет активной заявки - добавляем в список
                     not_subscribed.append((channel_id, username, title, invite_link, is_private))
-                    continue
-                
-                try:
-                    member = await context.bot.get_chat_member(chat_id=channel_id, user_id=user_id)
-                    if member.status in ['left', 'kicked']:
-                        not_subscribed.append((channel_id, username, title, invite_link, is_private))
-                except Exception as e:
-                    not_subscribed.append((channel_id, username, title, invite_link, is_private))
+                    
             else:
+                # ДЛЯ ПУБЛИЧНЫХ КАНАЛОВ - стандартная проверка подписки
                 member = await context.bot.get_chat_member(chat_id=channel_id, user_id=user_id)
                 if member.status in ['left', 'kicked']:
                     not_subscribed.append((channel_id, username, title, invite_link, is_private))
@@ -985,7 +1113,7 @@ async def show_subscription_required(update: Update, context: ContextTypes.DEFAU
         
         if is_private and invite_link:
             url = invite_link
-            button_text = f"🔒 {channel_name} (Maxfiy kanal)"
+            button_text = f"🔒 {channel_name} (Maxfiy kanal - ariza qoldiring)"
         elif invite_link:
             url = invite_link
             button_text = f"📢 {channel_name}"
@@ -1007,9 +1135,11 @@ async def show_subscription_required(update: Update, context: ContextTypes.DEFAU
     for channel_id, username, title, invite_link, is_private in not_subscribed_channels:
         channel_name = title or username or f"Kanal {channel_id}"
         if is_private:
-            text += f"• 🔒 {channel_name} (Maxfiy kanal - invite link orqali)\n"
+            text += f"• 🔒 {channel_name} (Maxfiy kanal - ariza qoldiring)\n"
         else:
             text += f"• 📢 {channel_name}\n"
+    
+    text += "\nObuna bo'lgachingiz yoki ariza qoldirgachingiz «✅ Tekshirish» tugmasini bosing."
     
     try:
         if update.callback_query:
@@ -1020,6 +1150,88 @@ async def show_subscription_required(update: Update, context: ContextTypes.DEFAU
     except Exception as e:
         logger.error(f"Obunani ko'rsatish xatosi: {e}")
         return False
+
+async def check_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    not_subscribed = await check_subscription(user.id, context)
+    
+    if not not_subscribed:
+        await query.edit_message_text(
+            "✅ Ajoyib! Endi siz botdan foydalanishingiz mumkin.",
+            reply_markup=get_main_menu_inline_keyboard()  # ИСПРАВЛЕНИЕ: используем inline клавиатуру
+        )
+    else:
+        await show_subscription_required(update, context, not_subscribed)
+
+# НОВЫЕ ОБРАБОТЧИКИ ДЛЯ ЗАЯВОК
+async def handle_chat_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает новые заявки на вступление в приватные каналы"""
+    join_request = update.chat_join_request
+    user = join_request.from_user
+    chat = join_request.chat
+    
+    # Добавляем пользователя в базу если его нет
+    db.add_user(user.id, user.username, user.first_name, user.last_name)
+    
+    # Сохраняем заявку в базу данных
+    success = db.add_channel_request(user.id, chat.id, 'pending')
+    
+    if success:
+        logger.info(f"Yangi so'rov: {user.id} -> {chat.id}")
+        
+        # Уведомляем админов о новой заявке
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"🆕 Yangi so'rov!\n\n"
+                         f"👤 Foydalanuvchi: {user.first_name} (@{user.username or 'Noma lum'})\n"
+                         f"📢 Kanal: {chat.title}\n"
+                         f"🆔 User ID: {user.id}\n"
+                         f"🆔 Chat ID: {chat.id}"
+                )
+            except Exception as e:
+                logger.error(f"Adminni xabarlashda xato {admin_id}: {e}")
+
+async def handle_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает изменения статуса участников в каналах"""
+    chat_member = update.chat_member
+    user = chat_member.new_chat_member.user
+    chat = update.chat_member.chat
+    
+    # Проверяем, является ли канал приватным в нашей базе
+    channels = db.get_all_channels()
+    channel_ids = [channel[0] for channel in channels]
+    
+    if chat.id not in channel_ids:
+        return
+    
+    # Получаем информацию о канале
+    channel_info = next((c for c in channels if c[0] == chat.id), None)
+    if not channel_info:
+        return
+    
+    channel_id, username, title, invite_link, is_private = channel_info
+    
+    if not is_private:
+        return  # Только для приватных каналов
+    
+    # Обрабатываем изменения статуса
+    new_status = chat_member.new_chat_member.status
+    old_status = chat_member.old_chat_member.status
+    
+    # Пользователь принят в канал
+    if new_status in ['member', 'administrator'] and old_status in ['left', 'kicked']:
+        db.add_channel_request(user.id, chat.id, 'approved')
+        logger.info(f"Foydalanuvchi qabul qilindi: {user.id} -> {chat.id}")
+    
+    # Пользователь вышел из канала
+    elif new_status in ['left', 'kicked'] and old_status in ['member', 'administrator']:
+        db.add_channel_request(user.id, chat.id, 'cancelled')
+        logger.info(f"Foydalanuvchi chiqib ketdi: {user.id} -> {chat.id}")
 
 # КЛАВИАТУРЫ
 def get_main_keyboard():
@@ -1507,27 +1719,23 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает помощь"""
     codes_channel = db.get_setting('codes_channel') or CODES_CHANNEL
     
-    help_text = f"""
-🤖 Botdan foydalanish bo'yicha ko'rsatma:
-
-🔍 **Qidirish:**
-• Film nomi yoki kodini kiriting
-• Qisman nom ham ishlaydi (masalan: "Tezlik")
-• Kategoriyalar - janr, davlat, yil bo'yicha qidiring
-
-📊 **Ko'rish:**
-• Barcha filmlar - barcha mavjud filmlar ro'yxati
-• Yangi filmlar (2020-2025) - so'nggi yillardagi yangi filmlar
-• Top filmlar - eng ko'p ko'rilgan filmlar
-• Tasodifiy film - tasodifiy filmni ko'rish
-
-❤️ **Shaxsiy:**
-• Mening filmlarim - saqlangan filmlaringiz
-• Baholash - filmlarni baholashingiz mumkin
-• Shikoyat qilish - muammoli filmlarni xabar bering
-
-📺 Barcha video kodlari: {codes_channel}
-    """
+    help_text = (
+        "🤖 Botdan foydalanish bo'yicha ko'rsatma:\n\n"
+        "🔍 **Qidirish:**\n"
+        "• Film nomi yoki kodini kiriting\n"
+        "• Qisman nom ham ishlaydi (masalan: 'Tezlik')\n"
+        "• Kategoriyalar - janr, davlat, yil bo'yicha qidiring\n\n"
+        "📊 **Ko'rish:**\n"
+        "• Barcha filmlar - barcha mavjud filmlar ro'yxati\n"
+        "• Yangi filmlar (2020-2025) - so'nggi yillardagi yangi filmlar\n"
+        "• Top filmlar - eng ko'p ko'rilgan filmlar\n"
+        "• Tasodifiy film - tasodifiy filmni ko'rish\n\n"
+        "❤️ **Shaxsiy:**\n"
+        "• Mening filmlarim - saqlangan filmlaringiz\n"
+        "• Baholash - filmlarni baholashingiz mumkin\n"
+        "• Shikoyat qilish - muammoli filmlarni xabar bering\n\n"
+        f"📺 Barcha video kodlari: {codes_channel}"
+    )
     
     if update.callback_query:
         await update.callback_query.message.reply_text(help_text)
@@ -1701,6 +1909,60 @@ async def format_movie_info(movie_code, user_id):
     
     return movie_info
 
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РЕЙТИНГОВ И ЖАЛОБ
+async def show_rating_options(query, movie_code):
+    """Показывает опции для оценки фильма"""
+    movie_info = await format_movie_info(movie_code, query.from_user.id)
+    text = f"{movie_info}\n\nFilmini baholang:"
+    
+    await query.edit_message_text(text, reply_markup=get_rating_keyboard(movie_code))
+
+async def show_report_options(query, movie_code):
+    """Показывает опции для жалобы"""
+    movie_info = await format_movie_info(movie_code, query.from_user.id)
+    text = f"⚠️ **FILMGA SHIKOYAT** ⚠️\n\n{movie_info}\n\nShikoyat turini tanlang:"
+    
+    await query.edit_message_text(text, reply_markup=get_report_keyboard(movie_code))
+
+async def send_movie_details(query, movie_code, user_id):
+    """Отправляет детали фильма"""
+    movie_info = await format_movie_info(movie_code, user_id)
+    await query.edit_message_text(movie_info, reply_markup=get_movie_keyboard(user_id, movie_code))
+
+async def show_movies_by_category(query, category_type, category_value, page=0):
+    """Показывает фильмы по выбранной категории"""
+    limit = 5
+    offset = page * limit
+    
+    movies = db.get_movies_by_tag(category_type, category_value, limit, offset)
+    total_count = db.get_movies_count_by_tag(category_type, category_value)
+    total_pages = (total_count + limit - 1) // limit if total_count > 0 else 1
+    
+    if not movies:
+        await query.edit_message_text(
+            f"❌ '{category_value}' bo'yicha videolar topilmadi",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data=f"category_{category_type}")]])
+        )
+        return
+    
+    category_names = {
+        "genre": "Janr",
+        "country": "Davlat", 
+        "year": "Yil",
+        "quality": "Sifat"
+    }
+    
+    category_name = category_names.get(category_type, "Kategoriya")
+    
+    text = f"🎬 {category_name}: {category_value} (Sahifa {page+1}/{total_pages}):\n\n"
+    
+    for code, title in movies:
+        text += f"🎬 {title}\n🔗 Kod: {code}\n\n"
+    
+    keyboard = get_movies_list_keyboard(movies, page, total_pages, f"category_page_{category_type}_{category_value}")
+    
+    await query.edit_message_text(text, reply_markup=keyboard)
+
 # АДМИН ФУНКЦИИ
 async def show_admin_stats(query):
     """Показывает статистику для админа"""
@@ -1709,16 +1971,18 @@ async def show_admin_stats(query):
     channels_count = len(db.get_all_channels())
     daily_users = db.get_daily_active_users()
     pending_reports, total_reports = db.get_reports_count()
+    pending_requests = db.get_pending_requests_count()
     
-    text = f"""📊 **Admin statistikasi:**
-
-🎬 **Filmlar:** {movies_count}
-👥 **Foydalanuvchilar:** {users_count}
-📢 **Kanallar:** {channels_count}
-📈 **Kunlik aktiv:** {daily_users}
-⚠️ **Shikoyatlar:** {pending_reports}/{total_reports}
-
-**Kanallar ro'yxati:**"""
+    text = (
+        f"📊 **Admin statistikasi:**\n\n"
+        f"🎬 **Filmlar:** {movies_count}\n"
+        f"👥 **Foydalanuvchilar:** {users_count}\n"
+        f"📢 **Kanallar:** {channels_count}\n"
+        f"📈 **Kunlik aktiv:** {daily_users}\n"
+        f"⚠️ **Shikoyatlar:** {pending_reports}/{total_reports}\n"
+        f"🆕 **Kutilayotgan so'rovlar:** {pending_requests}\n\n"
+        f"**Kanallar ro'yxati:**"
+    )
     
     channels = db.get_all_channels()
     for channel_id, username, title, invite_link, is_private in channels:
@@ -1765,17 +2029,15 @@ async def show_delete_confirmation(query, movie_code):
     
     code, file_id, caption, title, duration, file_size = movie
     
-    text = f"⚠️ **FILMNI O'CHIRISH** ⚠️\n\n"
-    text += f"🎬 **Film:** {title}\n"
-    text += f"🔗 **Kod:** {code}\n"
-    
-    # Исправленная строка - безопасное получение рейтинга
-    avg_rating, rating_count = db.get_movie_rating(movie_code)
-    text += f"📊 **Ko'rishlar:** {rating_count}\n\n"
-    
-    text += "❌ **Diqqat! Bu amalni ortga qaytarib bo'lmaydi!**\n"
-    text += "Film butunlay o'chib ketadi.\n\n"
-    text += "Rostan ham o'chirmoqchimisiz?"
+    text = (
+        f"⚠️ **FILMNI O'CHIRISH** ⚠️\n\n"
+        f"🎬 **Film:** {title}\n"
+        f"🔗 **Kod:** {code}\n"
+        f"📊 **Ko'rishlar:** {duration}\n\n"
+        f"❌ **Diqqat! Bu amalni ortga qaytarib bo'lmaydi!**\n"
+        f"Film butunlay o'chib ketadi.\n\n"
+        f"Rostan ham o'chirmoqchimisiz?"
+    )
     
     await query.edit_message_text(text, reply_markup=get_admin_delete_confirmation_keyboard(movie_code))
 
@@ -1820,7 +2082,7 @@ async def show_admin_movie_info(query, movie_code):
         text += f"⭐ **Reyting:** Baho yo'q\n"
         
     text += f"❤️ **Saqlangan:** {favorites_count} marta\n"
-    text += f"👁️ **Ko'rishlar:** {rating_count}\n"
+    text += f"👁️ **Ko'rishlar:** {duration}\n"
     
     if duration and duration > 0:
         hours = duration // 3600
@@ -1899,13 +2161,15 @@ async def show_admin_report_info(query, report_id):
     report_id, user_id, movie_code, report_type, description, created_at, username, first_name, title = report
     user_display = f"@{username}" if username else first_name
     
-    text = f"⚠️ **SHIKOYAT MA'LUMOTLARI** ⚠️\n\n"
-    text += f"🆔 **ID:** #{report_id}\n"
-    text += f"👤 **Foydalanuvchi:** {user_display} (ID: {user_id})\n"
-    text += f"🎬 **Film:** {title}\n"
-    text += f"🔗 **Kod:** {movie_code}\n"
-    text += f"📝 **Turi:** {get_report_type_name(report_type)}\n"
-    text += f"📅 **Sana:** {created_at}\n\n"
+    text = (
+        f"⚠️ **SHIKOYAT MA'LUMOTLARI** ⚠️\n\n"
+        f"🆔 **ID:** #{report_id}\n"
+        f"👤 **Foydalanuvchi:** {user_display} (ID: {user_id})\n"
+        f"🎬 **Film:** {title}\n"
+        f"🔗 **Kod:** {movie_code}\n"
+        f"📝 **Turi:** {get_report_type_name(report_type)}\n"
+        f"📅 **Sana:** {created_at}\n\n"
+    )
     
     if description:
         text += f"📄 **Izoh:**\n{description}\n\n"
@@ -1966,10 +2230,12 @@ async def show_admin_settings(query):
     archive_channel = db.get_setting('archive_channel')
     codes_channel = db.get_setting('codes_channel')
     
-    text = f"⚙️ **Bot sozlamalari:**\n\n"
-    text += f"📁 **Arxiv kanali:** {archive_channel}\n"
-    text += f"📋 **Kodlar kanali:** {codes_channel}\n\n"
-    text += "Quyidagi sozlamalarni o'zgartirishingiz mumkin:"
+    text = (
+        f"⚙️ **Bot sozlamalari:**\n\n"
+        f"📁 **Arxiv kanali:** {archive_channel}\n"
+        f"📋 **Kodlar kanali:** {codes_channel}\n\n"
+        f"Quyidagi sozlamalarni o'zgartirishingiz mumkin:"
+    )
     
     await query.edit_message_text(text, reply_markup=get_admin_settings_keyboard())
 
@@ -2006,317 +2272,6 @@ async def show_admin_analytics(query):
     
     keyboard = [[InlineKeyboardButton("🔙 Orqaga", callback_data="main_menu")]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-# ОБРАБОТЧИК CALLBACK
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    data = query.data
-    
-    db.update_user_activity(user.id)
-    db.log_user_activity(user.id, "callback", data)
-    
-    if user.id not in ADMIN_IDS:
-        if not await require_subscription(update, context):
-            return
-    
-    # Основные обработчики
-    if data == "main_menu":
-        if user.id in ADMIN_IDS:
-            await query.edit_message_text("👨‍💻 Admin paneli:", reply_markup=get_admin_keyboard())
-        else:
-            await query.edit_message_text("Bosh menyu:", reply_markup=get_main_menu_inline_keyboard())
-    
-    elif data == "categories":
-        await query.edit_message_text("Qidiruv turini tanlang:", reply_markup=get_categories_keyboard())
-    
-    elif data.startswith("all_movies_"):
-        page = int(data.split("_")[2])
-        await show_all_movies(update, context, page)
-    
-    elif data == "search_by_code":
-        await query.edit_message_text(
-            "🔍 Film nomi yoki kodini kiriting:\n\n"
-            "Misol: <code>Avatar</code> yoki <code>AVATAR2024</code>\n"
-            "Yoki: <code>Tezlik</code> (qisman nom)",
-            parse_mode="HTML"
-        )
-    
-    elif data == "random_movie":
-        await send_random_movie(update, context)
-    
-    elif data == "help":
-        await show_help(update, context)
-    
-    elif data == "category_genre":
-        await query.edit_message_text("🎭 Janrni tanlang:", reply_markup=get_genres_keyboard())
-    
-    elif data == "category_country":
-        await query.edit_message_text("🌎 Davlatni tanlang:", reply_markup=get_countries_keyboard())
-    
-    elif data == "category_year":
-        await query.edit_message_text("🗓️ Yilni tanlang:", reply_markup=get_years_keyboard())
-    
-    elif data == "category_quality":
-        await query.edit_message_text("📹 Sifatni tanlang:", reply_markup=get_qualities_keyboard())
-    
-    elif data.startswith("select_"):
-        parts = data.split("_")
-        if len(parts) >= 3:
-            category_type = parts[1]
-            category_value = parts[2]
-            await show_movies_by_category(query, category_type, category_value)
-    
-    elif data.startswith("category_page_"):
-        parts = data.split("_")
-        if len(parts) >= 5:
-            category_type = parts[2]
-            category_value = parts[3]
-            page = int(parts[4])
-            await show_movies_by_category(query, category_type, category_value, page)
-    
-    elif data.startswith("recent_movies_"):
-        page = int(data.split("_")[2])
-        await show_recent_movies(update, context, page)
-    
-    elif data.startswith("top_movies_"):
-        page = int(data.split("_")[2])
-        await show_top_movies(update, context, page)
-    
-    elif data.startswith("favorites_"):
-        page = int(data.split("_")[1])
-        await show_favorites(update, context, page)
-    
-    elif data.startswith("download_"):
-        movie_code = data.split("_")[1]
-        success = await send_movie_to_user(update, context, movie_code, user.id)
-        if not success:
-            await query.answer("❌ Videoni yuborishda xato", show_alert=True)
-    
-    elif data.startswith("fav_"):
-        movie_code = data.split("_")[1]
-        
-        if db.is_favorite(user.id, movie_code):
-            db.remove_from_favorites(user.id, movie_code)
-            await query.answer("❌ Film olib tashlandi")
-        else:
-            db.add_to_favorites(user.id, movie_code)
-            await query.answer("❤️ Film saqlandi")
-        
-        movie = db.get_movie(movie_code)
-        if movie:
-            movie_info = await format_movie_info(movie_code, user.id)
-            await query.edit_message_text(
-                movie_info,
-                reply_markup=get_movie_keyboard(user.id, movie_code)
-            )
-    
-    elif data.startswith("rate_"):
-        movie_code = data.split("_")[1]
-        await show_rating_options(query, movie_code)
-    
-    elif data.startswith("rating_"):
-        parts = data.split("_")
-        movie_code = parts[1]
-        rating = int(parts[2])
-        
-        db.add_rating(user.id, movie_code, rating)
-        await query.answer(f"✅ {rating} baho qo'yildi!")
-        
-        movie_info = await format_movie_info(movie_code, user.id)
-        await query.edit_message_text(
-            movie_info,
-            reply_markup=get_movie_keyboard(user.id, movie_code)
-        )
-    
-    elif data.startswith("report_"):
-        movie_code = data.split("_")[1]
-        movie = db.get_movie(movie_code)
-        if not movie:
-            await query.answer("❌ Film topilmadi", show_alert=True)
-            return
-        await show_report_options(query, movie_code)
-    
-    elif data == "check_subscription":
-        await check_subscription_callback(update, context)
-
-    # АДМИН ОБРАБОТЧИКИ
-    elif data == "admin_stats":
-        await show_admin_stats(query)
-    elif data.startswith("admin_movies_"):
-        page = int(data.split("_")[2])
-        await show_admin_movies(query, page)
-    elif data.startswith("admin_delete_movies_"):
-        page = int(data.split("_")[3])
-        await show_admin_movies(query, page, delete_mode=True)
-    elif data.startswith("admin_delete_"):
-        movie_code = data.split("_")[2]
-        await show_delete_confirmation(query, movie_code)
-    elif data.startswith("admin_confirm_delete_"):
-        movie_code = data.split("_")[3]
-        await delete_movie_confirmed(query, movie_code)
-    elif data.startswith("admin_movie_info_"):
-        movie_code = data.split("_")[3]
-        await show_admin_movie_info(query, movie_code)
-    elif data.startswith("admin_reports_"):
-        page = int(data.split("_")[2])
-        await show_admin_reports(query, page)
-    elif data.startswith("admin_report_info_"):
-        report_id = int(data.split("_")[3])
-        await show_admin_report_info(query, report_id)
-    elif data.startswith("admin_resolve_report_"):
-        report_id = int(data.split("_")[3])
-        await resolve_report_confirmed(query, report_id)
-    elif data == "admin_channels":
-        await show_admin_channels(query)
-    elif data == "admin_settings":
-        await show_admin_settings(query)
-    elif data == "admin_set_archive":
-        await set_archive_channel(query, context)
-    elif data == "admin_set_codes":
-        await set_codes_channel(query, context)
-    elif data == "admin_analytics":
-        await show_admin_analytics(query)
-    elif data == "admin_broadcast":
-        await query.message.reply_text("📨 Xabar yuborish uchun xabarga javob bering: /broadcast")
-
-    elif data.startswith("report_type_"):
-        parts = data.split("_")
-        if len(parts) >= 4:
-            movie_code = parts[2]
-            report_type = parts[3]
-            
-            # Проверяем существование фильма
-            movie = db.get_movie(movie_code)
-            if not movie:
-                await query.answer("❌ Film topilmadi", show_alert=True)
-                return
-            
-            # Сохраняем тип жалобы в контексте
-            context.user_data['current_report'] = {
-                'movie_code': movie_code,
-                'report_type': report_type
-            }
-            
-            await query.edit_message_text(
-                f"⚠️ Shikoyat turi: {get_report_type_name(report_type)}\n\n"
-                "Qo'shimcha izoh yozing (ixtiyoriy):\n\n"
-                "Misol: <i>Video sifat yomon, to'liq ko'rinmayapti</i>",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🚫 Izohsiz yuborish", callback_data=f"report_submit_{movie_code}")],
-                    [InlineKeyboardButton("🔙 Orqaga", callback_data=f"back_to_movie_{movie_code}")]
-                ])
-            )
-    
-    elif data.startswith("report_submit_"):
-        parts = data.split("_")
-        if len(parts) >= 3:
-            movie_code = parts[2]
-            report_data = context.user_data.get('current_report', {})
-            
-            # Проверяем существование фильма
-            movie = db.get_movie(movie_code)
-            if not movie:
-                await query.answer("❌ Film topilmadi", show_alert=True)
-                return
-            
-            if report_data.get('movie_code') == movie_code:
-                report_type = report_data.get('report_type')
-                description = report_data.get('description')
-                
-                success = db.add_report(user.id, movie_code, report_type, description)
-                if success:
-                    await query.edit_message_text(
-                        "✅ Shikoyatingiz qabul qilindi!\n\n"
-                        "Administratorlar tez orada ko'rib chiqishadi.\n"
-                        "Hisobingizga e'tiboringiz uchun rahmat!",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🔙 Orqaga", callback_data=f"back_to_movie_{movie_code}")]
-                        ])
-                    )
-                else:
-                    await query.answer("❌ Shikoyat yuborishda xato", show_alert=True)
-            
-            # Очищаем контекст
-            if 'current_report' in context.user_data:
-                del context.user_data['current_report']
-    
-    elif data.startswith("back_to_movie_"):
-        parts = data.split("_")
-        if len(parts) >= 4:
-            movie_code = parts[3]
-            await send_movie_details(query, movie_code, user.id)
-
-async def check_subscription_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    not_subscribed = await check_subscription(user.id, context)
-    
-    if not not_subscribed:
-        await query.message.reply_text(
-            "✅ Ajoyib! Endi siz botdan foydalanishingiz mumkin.",
-            reply_markup=get_main_keyboard()
-        )
-    else:
-        await show_subscription_required(update, context, not_subscribed)
-
-async def show_rating_options(query, movie_code):
-    """Показывает опции для оценки фильма"""
-    movie_info = await format_movie_info(movie_code, query.from_user.id)
-    text = f"{movie_info}\n\nFilmini baholang:"
-    
-    await query.edit_message_text(text, reply_markup=get_rating_keyboard(movie_code))
-
-async def show_report_options(query, movie_code):
-    """Показывает опции для жалобы"""
-    movie_info = await format_movie_info(movie_code, query.from_user.id)
-    text = f"⚠️ **FILMGA SHIKOYAT** ⚠️\n\n{movie_info}\n\nShikoyat turini tanlang:"
-    
-    await query.edit_message_text(text, reply_markup=get_report_keyboard(movie_code))
-
-async def send_movie_details(query, movie_code, user_id):
-    """Отправляет детали фильма"""
-    movie_info = await format_movie_info(movie_code, user_id)
-    await query.edit_message_text(movie_info, reply_markup=get_movie_keyboard(user_id, movie_code))
-
-async def show_movies_by_category(query, category_type, category_value, page=0):
-    """Показывает фильмы по выбранной категории"""
-    limit = 5
-    offset = page * limit
-    
-    movies = db.get_movies_by_tag(category_type, category_value, limit, offset)
-    total_count = db.get_movies_count_by_tag(category_type, category_value)
-    total_pages = (total_count + limit - 1) // limit if total_count > 0 else 1
-    
-    if not movies:
-        await query.edit_message_text(
-            f"❌ '{category_value}' bo'yicha videolar topilmadi",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data=f"category_{category_type}")]])
-        )
-        return
-    
-    category_names = {
-        "genre": "Janr",
-        "country": "Davlat", 
-        "year": "Yil",
-        "quality": "Sifat"
-    }
-    
-    category_name = category_names.get(category_type, "Kategoriya")
-    
-    text = f"🎬 {category_name}: {category_value} (Sahifa {page+1}/{total_pages}):\n\n"
-    
-    for code, title in movies:
-        text += f"🎬 {title}\n🔗 Kod: {code}\n\n"
-    
-    keyboard = get_movies_list_keyboard(movies, page, total_pages, f"category_page_{category_type}_{category_value}")
-    
-    await query.edit_message_text(text, reply_markup=keyboard)
 
 # ОБРАБОТЧИК ВИДЕО ДЛЯ АДМИНОВ
 async def handle_admin_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2609,6 +2564,249 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         context.user_data.pop('waiting_for_codes_channel', None)
 
+# ОБРАБОТЧИК CALLBACK
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    data = query.data
+    
+    db.update_user_activity(user.id)
+    db.log_user_activity(user.id, "callback", data)
+    
+    if user.id not in ADMIN_IDS:
+        if not await require_subscription(update, context):
+            return
+    
+    # Основные обработчики
+    if data == "main_menu":
+        if user.id in ADMIN_IDS:
+            await query.edit_message_text("👨‍💻 Admin paneli:", reply_markup=get_admin_keyboard())
+        else:
+            await query.edit_message_text("Bosh menyu:", reply_markup=get_main_menu_inline_keyboard())
+    
+    elif data == "categories":
+        await query.edit_message_text("Qidiruv turini tanlang:", reply_markup=get_categories_keyboard())
+    
+    elif data.startswith("all_movies_"):
+        page = int(data.split("_")[2])
+        await show_all_movies(update, context, page)
+    
+    elif data == "search_by_code":
+        await query.edit_message_text(
+            "🔍 Film nomi yoki kodini kiriting:\n\n"
+            "Misol: <code>Avatar</code> yoki <code>AVATAR2024</code>\n"
+            "Yoki: <code>Tezlik</code> (qisman nom)",
+            parse_mode="HTML"
+        )
+    
+    elif data == "random_movie":
+        await send_random_movie(update, context)
+    
+    elif data == "help":
+        await show_help(update, context)
+    
+    elif data == "category_genre":
+        await query.edit_message_text("🎭 Janrni tanlang:", reply_markup=get_genres_keyboard())
+    
+    elif data == "category_country":
+        await query.edit_message_text("🌎 Davlatni tanlang:", reply_markup=get_countries_keyboard())
+    
+    elif data == "category_year":
+        await query.edit_message_text("🗓️ Yilni tanlang:", reply_markup=get_years_keyboard())
+    
+    elif data == "category_quality":
+        await query.edit_message_text("📹 Sifatni tanlang:", reply_markup=get_qualities_keyboard())
+    
+    elif data.startswith("select_"):
+        parts = data.split("_")
+        if len(parts) >= 3:
+            category_type = parts[1]
+            category_value = parts[2]
+            await show_movies_by_category(query, category_type, category_value)
+    
+    elif data.startswith("category_page_"):
+        parts = data.split("_")
+        if len(parts) >= 5:
+            category_type = parts[2]
+            category_value = parts[3]
+            page = int(parts[4])
+            await show_movies_by_category(query, category_type, category_value, page)
+    
+    elif data.startswith("recent_movies_"):
+        page = int(data.split("_")[2])
+        await show_recent_movies(update, context, page)
+    
+    elif data.startswith("top_movies_"):
+        page = int(data.split("_")[2])
+        await show_top_movies(update, context, page)
+    
+    elif data.startswith("favorites_"):
+        page = int(data.split("_")[1])
+        await show_favorites(update, context, page)
+    
+    elif data.startswith("download_"):
+        movie_code = data.split("_")[1]
+        success = await send_movie_to_user(update, context, movie_code, user.id)
+        if not success:
+            await query.answer("❌ Videoni yuborishda xato", show_alert=True)
+    
+    elif data.startswith("fav_"):
+        movie_code = data.split("_")[1]
+        
+        if db.is_favorite(user.id, movie_code):
+            db.remove_from_favorites(user.id, movie_code)
+            await query.answer("❌ Film olib tashlandi")
+        else:
+            db.add_to_favorites(user.id, movie_code)
+            await query.answer("❤️ Film saqlandi")
+        
+        movie = db.get_movie(movie_code)
+        if movie:
+            movie_info = await format_movie_info(movie_code, user.id)
+            await query.edit_message_text(
+                movie_info,
+                reply_markup=get_movie_keyboard(user.id, movie_code)
+            )
+    
+    elif data.startswith("rate_"):
+        movie_code = data.split("_")[1]
+        await show_rating_options(query, movie_code)
+    
+    elif data.startswith("rating_"):
+        parts = data.split("_")
+        movie_code = parts[1]
+        rating = int(parts[2])
+        
+        db.add_rating(user.id, movie_code, rating)
+        await query.answer(f"✅ {rating} baho qo'yildi!")
+        
+        movie_info = await format_movie_info(movie_code, user.id)
+        await query.edit_message_text(
+            movie_info,
+            reply_markup=get_movie_keyboard(user.id, movie_code)
+        )
+    
+    elif data.startswith("report_"):
+        movie_code = data.split("_")[1]
+        movie = db.get_movie(movie_code)
+        if not movie:
+            await query.answer("❌ Film topilmadi", show_alert=True)
+            return
+        await show_report_options(query, movie_code)
+    
+    elif data == "check_subscription":
+        await check_subscription_callback(update, context)
+
+    # АДМИН ОБРАБОТЧИКИ
+    elif data == "admin_stats":
+        await show_admin_stats(query)
+    elif data.startswith("admin_movies_"):
+        page = int(data.split("_")[2])
+        await show_admin_movies(query, page)
+    elif data.startswith("admin_delete_movies_"):
+        page = int(data.split("_")[3])
+        await show_admin_movies(query, page, delete_mode=True)
+    elif data.startswith("admin_delete_"):
+        movie_code = data.split("_")[2]
+        await show_delete_confirmation(query, movie_code)
+    elif data.startswith("admin_confirm_delete_"):
+        movie_code = data.split("_")[3]
+        await delete_movie_confirmed(query, movie_code)
+    elif data.startswith("admin_movie_info_"):
+        movie_code = data.split("_")[3]
+        await show_admin_movie_info(query, movie_code)
+    elif data.startswith("admin_reports_"):
+        page = int(data.split("_")[2])
+        await show_admin_reports(query, page)
+    elif data.startswith("admin_report_info_"):
+        report_id = int(data.split("_")[3])
+        await show_admin_report_info(query, report_id)
+    elif data.startswith("admin_resolve_report_"):
+        report_id = int(data.split("_")[3])
+        await resolve_report_confirmed(query, report_id)
+    elif data == "admin_channels":
+        await show_admin_channels(query)
+    elif data == "admin_settings":
+        await show_admin_settings(query)
+    elif data == "admin_set_archive":
+        await set_archive_channel(query, context)
+    elif data == "admin_set_codes":
+        await set_codes_channel(query, context)
+    elif data == "admin_analytics":
+        await show_admin_analytics(query)
+    elif data == "admin_broadcast":
+        await query.message.reply_text("📨 Xabar yuborish uchun xabarga javob bering: /broadcast")
+    
+    elif data.startswith("report_type_"):
+        parts = data.split("_")
+        if len(parts) >= 4:
+            movie_code = parts[2]
+            report_type = parts[3]
+            
+            # Проверяем существование фильма
+            movie = db.get_movie(movie_code)
+            if not movie:
+                await query.answer("❌ Film topilmadi", show_alert=True)
+                return
+            
+            # Сохраняем тип жалобы в контексте
+            context.user_data['current_report'] = {
+                'movie_code': movie_code,
+                'report_type': report_type
+            }
+            
+            await query.edit_message_text(
+                f"⚠️ Shikoyat turi: {get_report_type_name(report_type)}\n\n"
+                "Qo'shimcha izoh yozing (ixtiyoriy):\n\n"
+                "Misol: <i>Video sifat yomon, to'liq ko'rinmayapti</i>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🚫 Izohsiz yuborish", callback_data=f"report_submit_{movie_code}")],
+                    [InlineKeyboardButton("🔙 Orqaga", callback_data=f"back_to_movie_{movie_code}")]
+                ])
+            )
+    
+    elif data.startswith("report_submit_"):
+        parts = data.split("_")
+        if len(parts) >= 3:
+            movie_code = parts[2]
+            report_data = context.user_data.get('current_report', {})
+            
+            # Проверяем существование фильма
+            movie = db.get_movie(movie_code)
+            if not movie:
+                await query.answer("❌ Film topilmadi", show_alert=True)
+                return
+            
+            if report_data.get('movie_code') == movie_code:
+                report_type = report_data.get('report_type')
+                description = report_data.get('description')
+                
+                success = db.add_report(user.id, movie_code, report_type, description)
+                if success:
+                    await query.edit_message_text(
+                        "✅ Shikoyatingiz qabul qilindi!\n\n"
+                        "Administratorlar tez orada ko'rib chiqishadi.\n"
+                        "Hisobingizga e'tiboringiz uchun rahmat!",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔙 Orqaga", callback_data=f"back_to_movie_{movie_code}")]
+                        ])
+                    )
+                else:
+                    await query.answer("❌ Shikoyat yuborishda xato", show_alert=True)
+            
+            # Очищаем контекст
+            if 'current_report' in context.user_data:
+                del context.user_data['current_report']
+    
+    elif data.startswith("back_to_movie_"):
+        parts = data.split("_")
+        if len(parts) >= 4:
+            movie_code = parts[3]
+            await send_movie_details(query, movie_code, user.id)
+
 def main():
     application = Application.builder().token(BOT_TOKEN).build()
     
@@ -2624,6 +2822,10 @@ def main():
     application.add_handler(CommandHandler("top", top_command))
     application.add_handler(CommandHandler("search", search_command))
     
+    # НОВЫЕ ОБРАБОТЧИКИ ДЛЯ ЗАЯВОК
+    application.add_handler(ChatJoinRequestHandler(handle_chat_join_request))
+    application.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
+    
     # Обработчики сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_message))
@@ -2637,11 +2839,14 @@ def main():
     
     print("🤖 Bot ishga tushdi!")
     print("✅ Barcha funksiyalar ishga tushirildi:")
-    print("   • 🔍 YANGI: Takomillashtirilgan qidiruv algoritmi")
+    print("   • 🔍 Takomillashtirilgan qidiruv algoritmi")
     print("   • 🎬 Aniqroq natijalar tartibi")
     print("   • 👨‍💻 Admin paneli (TO'LIQ ISHLAYDI)")
     print("   • 📢 Kanal boshqaruvi")
     print("   • ⚙️ Sozlamalar boshqaruvi")
+    print("   • 🔒 YANGI: Privat kanallar uchun so'rovlar tizimi")
+    print("   • 📨 Avtomatik so'rovlarni qayd etish")
+    print("   • 👥 Foydalanuvchi statusini kuzatish")
     
     application.run_polling()
 
